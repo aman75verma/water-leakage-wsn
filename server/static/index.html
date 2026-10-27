@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Leak Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#f4f6f8; --card:#fff; --fg:#1b2430; --mut:#6b7785; --line:#dde3ea;
+          --green:#1e9e57; --amber:#e8a317; --red:#d63a3a; --grey:#7b8794; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#10151b; --card:#19212a; --fg:#e6ebf0; --mut:#93a1b0; --line:#2a3541; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:1200px; margin:0 auto; padding:10px; }
+  .banner { padding:14px 16px; border-radius:10px; color:#fff; font-size:18px; font-weight:600; margin-bottom:10px; }
+  .banner small { display:block; font-weight:400; font-size:13px; opacity:.92; margin-top:2px; }
+  .green{background:var(--green)} .amber{background:var(--amber)} .red{background:var(--red)} .grey{background:var(--grey)}
+  .cards, .grid { display:grid; gap:10px; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); margin-bottom:10px; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
+  .panel h3 { margin:0 0 6px; font-size:14px; }
+  .chart { position:relative; height:220px; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; background:var(--grey); }
+  .dot.on { background:var(--green); } .dot.off { background:var(--red); }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; color:var(--mut); }
+  .kv b { color:var(--fg); font-weight:600; }
+  button, select, input { font:inherit; padding:7px 10px; border-radius:7px; border:1px solid var(--line); background:var(--card); color:var(--fg); }
+  button { cursor:pointer; } button.primary { background:#2b6cb0; color:#fff; border-color:#2b6cb0; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:6px 0; }
+  .cfg { display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:6px 12px; }
+  .cfg label { display:flex; justify-content:space-between; gap:8px; align-items:center; color:var(--mut); font-size:12px; }
+  .cfg input { width:90px; padding:4px 6px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:5px 6px; border-bottom:1px solid var(--line); }
+  .tag { padding:1px 8px; border-radius:10px; color:#fff; font-size:12px; }
+  progress { width:160px; }
+  #msg { color:var(--mut); font-size:13px; }
+</style>
+</head>
+<body>
+<main>
+  <div id="banner" class="banner grey">Connecting…</div>
+
+  <section class="cards" id="cards"></section>
+
+  <section class="grid">
+    <div class="panel"><h3>Flow (L/min): source, sink, mismatch</h3><div class="chart"><canvas id="cFlow"></canvas></div></div>
+    <div class="panel"><h3>Vibration RMS (mg)</h3><div class="chart"><canvas id="cVib"></canvas></div></div>
+    <div class="panel"><h3>Microphone level (dBFS)</h3><div class="chart"><canvas id="cMic"></canvas></div></div>
+    <div class="panel"><h3>Acoustic spectrum (dB, 100 Hz–8 kHz)</h3><div class="chart"><canvas id="cSpec"></canvas></div></div>
+  </section>
+
+  <section class="grid">
+    <div class="panel">
+      <h3>Baseline calibration</h3>
+      <div class="row">
+        <button class="primary" onclick="baseline('start')">Start baseline</button>
+        <button onclick="baseline('stop')">Stop &amp; save</button>
+        <progress id="calProg" value="0" max="1" style="display:none"></progress>
+      </div>
+      <div id="calInfo" style="color:var(--mut)">Close the T branch, run water at test flow, then start.</div>
+      <div id="msg"></div>
+      <h3 style="margin-top:14px">Data</h3>
+      <div class="row">
+        <select id="csvMin">
+          <option value="10">last 10 min</option><option value="60">last hour</option>
+          <option value="1440">last 24 h</option><option value="0">everything</option>
+        </select>
+        <button onclick="downloadCsv()">Download CSV</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>Thresholds <span style="font-weight:400;color:var(--mut)">(applied instantly, saved on server)</span></h3>
+      <div class="cfg" id="cfg"></div>
+      <div class="row"><button class="primary" onclick="saveCfg()">Save thresholds</button></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h3>Leak events</h3>
+    <div style="overflow-x:auto">
+    <table><thead><tr><th>Time</th><th>Change</th><th>Score</th><th>Mismatch</th><th>Location</th></tr></thead>
+    <tbody id="events"></tbody></table></div>
+  </section>
+</main>
+
+<script>
+const WINDOW_S = 120;
+const C = { unit_source: '#2b7bd6', unit_sink: '#e0553d', diff: '#2aa165' };
+const STATE_CLASS = { NORMAL: 'green', SUSPECTED: 'amber', LEAK: 'red' };
+
+function lineChart(id, series, yTitle) {
+  return new Chart(document.getElementById(id), {
+    type: 'line',
+    data: { datasets: series.map(([name, color, dash]) => ({
+      label: name, data: [], borderColor: color, backgroundColor: color,
+      borderWidth: 1.6, pointRadius: 0, tension: .2, borderDash: dash || [] })) },
+    options: { animation: false, responsive: true, maintainAspectRatio: false, parsing: false, normalized: true,
+      interaction: { mode: 'nearest', intersect: false },
+      scales: { x: { type: 'linear', ticks: { maxTicksLimit: 5, callback: v => new Date(v).toLocaleTimeString() } },
+                y: { title: { display: true, text: yTitle } } },
+      plugins: { legend: { labels: { boxWidth: 12 } } } }
+  });
+}
+const cFlow = lineChart('cFlow', [['Source', C.unit_source], ['Sink', C.unit_sink], ['Mismatch', C.diff, [5,3]]], 'L/min');
+const cVib  = lineChart('cVib',  [['unit_source', C.unit_source], ['unit_sink', C.unit_sink]], 'mg');
+const cMic  = lineChart('cMic',  [['unit_source', C.unit_source], ['unit_sink', C.unit_sink]], 'dBFS');
+
+const specLabels = Array.from({length:16}, (_, j) => {
+  const f = 100 * Math.pow(80, (j + .5) / 16); return f >= 1000 ? (f/1000).toFixed(1) + 'k' : Math.round(f);
+});
+const cSpec = new Chart(document.getElementById('cSpec'), {
+  type: 'bar',
+  data: { labels: specLabels, datasets: [
+    { label: 'unit_source', data: [], backgroundColor: C.unit_source },
+    { label: 'unit_sink', data: [], backgroundColor: C.unit_sink } ] },
+  options: { animation: false, responsive: true, maintainAspectRatio: false,
+    scales: { x: { title: { display: true, text: 'Hz' } }, y: { title: { display: true, text: 'dB' } } } }
+});
+
+function push(ch, i, x, y) {
+  if (y === null || y === undefined || Number.isNaN(y)) return;
+  const d = ch.data.datasets[i].data;
+  d.push({ x, y });
+  while (d.length && d[0].x < x - WINDOW_S * 1000) d.shift();
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const ch of [cFlow, cVib, cMic]) {
+    ch.options.scales.x.min = now - WINDOW_S * 1000;
+    ch.options.scales.x.max = now;
+    ch.update('none');
+  }
+  cSpec.update('none');
+}, 1000);
+
+// ---------------- WebSocket ----------------
+let ws;
+function connect() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.onopen = () => setBanner('grey', 'Connected, waiting for data…', '');
+  ws.onclose = () => { setBanner('grey', 'Dashboard disconnected, retrying…', ''); setTimeout(connect, 2000); };
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.type === 'sample') onSample(m); else if (m.type === 'status') onStatus(m);
+  };
+}
+function setBanner(cls, title, sub) {
+  const b = document.getElementById('banner');
+  b.className = 'banner ' + cls;
+  b.innerHTML = title + (sub ? '<small>' + sub + '</small>' : '');
+}
+
+function onSample(m) {
+  const i = m.unit === 'unit_sink' ? 1 : 0;
+  const t = m.t;
+  const r = (m.vib && m.vib.rms) || [];
+  if (r.length === 3 && m.vib.ok) push(cVib, i, t, 1000 * Math.sqrt(r[0]**2 + r[1]**2 + r[2]**2));
+  if (m.mic && m.mic.ok) {
+    push(cMic, i, t, m.mic.db);
+    if (m.mic.spec && m.mic.spec.length === 16) cSpec.data.datasets[i].data = m.mic.spec;
+  }
+}
+
+let lastState = null;
+function onStatus(s) {
+  const t = s.ts;
+  push(cFlow, 0, t, s.q_src); push(cFlow, 1, t, s.q_snk); push(cFlow, 2, t, s.mismatch);
+
+  const anyOnline = (s.units || []).some(u => u.online);
+  if (!anyOnline) setBanner('grey', 'NO DATA', 'No unit has reported in the last few seconds');
+  else if (s.calibrating) setBanner('grey', 'CALIBRATING baseline…', `${s.cal_elapsed_s}s / ${s.cal_total_s}s, keep flow steady, branch closed`);
+  else {
+    const sub = `score ${s.score.toFixed(2)} (flow ${s.s_flow.toFixed(2)}, acoustic ${s.s_ac.toFixed(2)})` +
+      (s.mismatch !== null ? ` · mismatch ${s.mismatch.toFixed(2)} L/min` : '') +
+      (s.state !== 'NORMAL' ? ` · location: ${s.location}` : '') +
+      (s.baseline_ok ? '' : ' · NO BASELINE (flow rule only)');
+    setBanner(STATE_CLASS[s.state] || 'grey', s.state === 'LEAK' ? 'LEAK DETECTED' : s.state === 'SUSPECTED' ? 'Leak suspected' : 'Normal', sub);
+  }
+  if (lastState !== null && lastState !== s.state) loadEvents();
+  lastState = s.state;
+
+  const prog = document.getElementById('calProg');
+  prog.style.display = s.calibrating ? '' : 'none';
+  prog.max = s.cal_total_s; prog.value = s.cal_elapsed_s;
+  renderCards(s.units || []);
+}
+
+function renderCards(units) {
+  const el = document.getElementById('cards');
+  el.innerHTML = units.map(u => `
+    <div class="panel">
+      <h3><span class="dot ${u.online ? 'on' : 'off'}"></span>${u.unit} <span style="font-weight:400;color:var(--mut)">${u.online ? 'online' : 'OFFLINE'}</span></h3>
+      <div class="kv">
+        <span>Last seen</span><b>${u.last_seen_s} s ago</b>
+        <span>Flow</span><b>${u.lpm ?? '–'} L/min ${u.flow_active ? '' : '(no pulses)'}</b>
+        <span>Wi-Fi RSSI</span><b>${u.rssi ?? '–'} dBm</b>
+        <span>Sensors</span><b>MPU ${u.mpu_ok ? 'OK' : 'FAIL'} · Mic ${u.mic_ok ? 'OK' : 'FAIL'}</b>
+        <span>Heap / uptime</span><b>${u.heap ?? '–'} B / ${u.up_s ?? '–'} s</b>
+        <span>Reconnects / buffered / dropped</span><b>${u.reconnects ?? 0} / ${u.buf ?? 0} / ${u.drops ?? 0}</b>
+        <span>Clock skew vs server</span><b>${u.clock_skew_s ?? '–'} s</b>
+      </div>
+    </div>`).join('') || '<div class="panel">No units seen yet. Power on the ESP32s.</div>';
+}
+
+// ---------------- controls ----------------
+async function baseline(action) {
+  const r = await fetch('/api/baseline/' + action, { method: 'POST' });
+  const j = await r.json().catch(() => ({}));
+  document.getElementById('msg').textContent = r.ok ? (j.message || 'baseline ' + action + 'ed') : (j.detail || 'error');
+}
+function downloadCsv() { location.href = '/api/export.csv?minutes=' + document.getElementById('csvMin').value; }
+
+async function loadCfg() {
+  const c = await (await fetch('/api/config')).json();
+  document.getElementById('cfg').innerHTML = Object.entries(c).map(([k, v]) =>
+    `<label>${k}<input data-k="${k}" type="number" step="any" value="${v}"></label>`).join('');
+}
+async function saveCfg() {
+  const body = {};
+  document.querySelectorAll('#cfg input').forEach(i => body[i.dataset.k] = parseFloat(i.value));
+  const r = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  document.getElementById('msg').textContent = r.ok ? 'Thresholds saved.' : 'Save failed.';
+}
+
+async function loadEvents() {
+  const ev = await (await fetch('/api/events?limit=30')).json();
+  document.getElementById('events').innerHTML = ev.map(e => `
+    <tr><td>${new Date(e.ts).toLocaleString()}</td>
+        <td>${e.prev_state} → <span class="tag ${STATE_CLASS[e.state]}">${e.state}</span></td>
+        <td>${(e.score ?? 0).toFixed(2)}</td>
+        <td>${e.mismatch === null ? '–' : e.mismatch.toFixed(2) + ' L/min'}</td>
+        <td>${e.location ?? ''}</td></tr>`).join('') || '<tr><td colspan="5" style="color:var(--mut)">No events yet</td></tr>';
+}
+
+connect(); loadCfg(); loadEvents(); setInterval(loadEvents, 15000);
+</script>
+</body>
+</html>
+
